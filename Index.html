@@ -57,17 +57,15 @@
   <main>
     <h1>AWB + Packing List Combiner</h1>
     <form id="combiner">
-    <label for="awb">Airway bill PDF</label>
-    <input id="awb" type="file" accept=".pdf,application/pdf"
-           aria-describedby="awb-size" required>
+      <label for="awb">Airway bill PDF</label>
+      <input id="awb" type="file" accept=".pdf,application/pdf" required>
 
-    <label for="packing">Packing list PDF</label>
-    <input id="packing" type="file" accept=".pdf,application/pdf"
-           aria-describedby="packing-size" required>
+      <label for="packing">Packing list PDF</label>
+      <input id="packing" type="file" accept=".pdf,application/pdf" required>
 
-    <button type="submit">Combine PDFs</button>
-    <a id="download" class="download" target="_blank" rel="noopener" hidden>Download PDF</a>
-    <p id="status" role="status" aria-live="polite"></p>
+      <button type="submit">Combine PDFs</button>
+      <a id="download" class="download" target="_blank" rel="noopener" hidden>Download PDF</a>
+      <p id="status" role="status" aria-live="polite"></p>
     </form>
   </main>
 
@@ -77,6 +75,29 @@
   </script>
   <script>
     const points = mm => mm * 72 / 25.4;
+
+    const quadrants = [
+      { column: 0, row: 0, label: 'top-left' },
+      { column: 0, row: 1, label: 'bottom-left' },
+      { column: 1, row: 0, label: 'top-right' },
+      { column: 1, row: 1, label: 'bottom-right' }
+    ];
+
+    const pdfJsBase = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/legacy/build/';
+    let pdfJsPromise;
+
+    function loadTextReader() {
+      if (!pdfJsPromise) {
+        pdfJsPromise = import(pdfJsBase + 'pdf.mjs').then(pdfjs => {
+          pdfjs.GlobalWorkerOptions.workerSrc = pdfJsBase + 'pdf.worker.mjs';
+          return pdfjs;
+        }).catch(() => {
+          pdfJsPromise = undefined;
+          throw new Error('The PDF text reader could not load. Reload the page and try again.');
+        });
+      }
+      return pdfJsPromise;
+    }
 
     function geometry(page) {
       const media = page.getMediaBox();
@@ -134,6 +155,174 @@
       }
     }
 
+    function orderIds(items) {
+      const lines = [];
+
+      for (const item of items.sort((a, b) => a.y - b.y || a.x - b.x)) {
+        let line = lines.at(-1);
+        if (!line || Math.abs(line.y - item.y) > 2) {
+          line = { y: item.y, items: [] };
+          lines.push(line);
+        }
+        line.items.push(item);
+      }
+
+      const textLines = lines.map(line => {
+        let previous;
+        let text = '';
+
+        for (const item of line.items.sort((a, b) => a.x - b.x)) {
+          if (previous && item.x - previous.endX > Math.max(0.6, item.height * 0.08)) {
+            text += ' ';
+          }
+          text += item.text;
+          previous = item;
+        }
+
+        return { y: line.y, text: text.trim() };
+      });
+
+      const ids = new Set();
+      const token = '[A-Z0-9]+(?:[-_/][A-Z0-9]+)*';
+      const sameLine = new RegExp('^\\s*[:#=]?\\s*(' + token + ')(?=$|[\\s,;.)])', 'i');
+      const ownLine = new RegExp('^\\s*(' + token + ')\\s*$', 'i');
+
+      for (const [index, line] of textLines.entries()) {
+        const labels = [...line.text.matchAll(/\border\s*id\b/gi)];
+
+        for (const [labelIndex, label] of labels.entries()) {
+          const afterLabel = line.text.slice(
+            label.index + label[0].length,
+            labels[labelIndex + 1]?.index
+          );
+
+          let match = afterLabel.match(sameLine);
+          const next = textLines[index + 1];
+
+          if (!match && /^\s*[:#=]?\s*$/.test(afterLabel) &&
+              next && next.y - line.y <= 24) {
+            match = next.text.match(ownLine);
+          }
+
+          if (match) ids.add(match[1].toUpperCase());
+        }
+      }
+
+      return [...ids];
+    }
+
+    async function readTextPages(pdfjs, file, views, split, label) {
+      const task = pdfjs.getDocument({
+        data: new Uint8Array(await file.arrayBuffer()),
+        isEvalSupported: false
+      });
+
+      try {
+        const document = await task.promise;
+        const result = [];
+
+        for (const [index, view] of views.entries()) {
+          const page = await document.getPage(index + 1);
+          const { box, rotation } = view;
+          const viewport = page.getViewport({ scale: 1, rotation });
+          const [leftX, bottomY] = viewport.convertToViewportPoint(box.left, box.bottom);
+          const [rightX, topY] = viewport.convertToViewportPoint(box.right, box.top);
+          const offsetX = Math.min(leftX, rightX);
+          const offsetY = Math.min(bottomY, topY);
+          const sections = split ? quadrants.map(() => []) : [[]];
+          const { items } = await page.getTextContent();
+
+          for (const item of items) {
+            if (!item.str?.trim()) continue;
+
+            const [a, b, , , tx, ty] = item.transform;
+            const angle = Math.atan2(b, a);
+            const [x, y] = viewport.convertToViewportPoint(tx, ty);
+            const [endX, endY] = viewport.convertToViewportPoint(
+              tx + item.width * Math.cos(angle),
+              ty + item.width * Math.sin(angle)
+            );
+
+            const centerX = (x + endX) / 2 - offsetX;
+            const centerY = (y + endY) / 2 - offsetY - item.height / 2;
+
+            if (centerX < 0 || centerX >= view.width ||
+                centerY < 0 || centerY >= view.height) continue;
+
+            const section = split
+                            ? 2 * Number(centerX >= view.width / 2) +
+                              Number(centerY >= view.height / 2)
+                            : 0;
+
+            sections[section].push({ text: item.str, x, y, endX, height: item.height });
+          }
+
+          result.push(sections.map(orderIds));
+        }
+
+        return result;
+      }
+      catch (error) {
+        throw new Error('Could not extract text from the ' + label + ' PDF. ' + error.message);
+      }
+      finally {
+        await task.destroy();
+      }
+    }
+
+    function matchSections(awbText, packingText) {
+      const byId = new Map();
+      let sectionsWithIds = 0;
+
+      for (const [sheet, sections] of packingText.entries()) {
+        for (const [part, ids] of sections.entries()) {
+          const location = 'Packing list page ' + (sheet + 1) + ', ' + quadrants[part].label;
+
+          if (ids.length > 1) {
+            throw new Error(location + ' has multiple Order IDs: ' + ids.join(', ') + '.');
+          }
+          if (!ids.length) continue;
+
+          const [id] = ids;
+          const matches = byId.get(id) ?? [];
+          matches.push({ sheet, part, location });
+          byId.set(id, matches);
+          sectionsWithIds++;
+        }
+      }
+
+      const errors = [];
+      const seen = new Set();
+
+      const pairs = awbText.map(([ids], index) => {
+        const location = 'AWB page ' + (index + 1);
+
+        if (ids.length !== 1) {
+          errors.push(ids.length
+            ? location + ' has multiple Order IDs: ' + ids.join(', ') + '.'
+            : location + ' has no readable Order ID.');
+          return;
+        }
+
+        const [id] = ids;
+        if (seen.has(id)) errors.push(location + ' repeats Order ID ' + id + '.');
+        seen.add(id);
+
+        const matches = byId.get(id) ?? [];
+        if (!matches.length) {
+          errors.push(location + ': no packing list section found for ' + id + '.');
+        } else if (matches.length > 1) {
+          errors.push(id + ' matches multiple sections: ' +
+            matches.map(match => match.location).join('; ') + '.');
+        }
+
+        return matches[0];
+      });
+
+      if (errors.length) throw new Error(errors.join('\n'));
+      return { pairs, sectionsWithIds };
+    }
+
     async function combine(awbFile, packingFile) {
       if (!window.PDFLib) {
         throw new Error('The PDF library could not load. Reload the page and try again.');
@@ -143,63 +332,58 @@
       const packing = await readPdf(packingFile, 'packing list');
       const awbViews = validate(awb, 'Airway bill', 99.8, 149.9);
       const packingViews = validate(packing, 'Packing list', 210, 297);
-      const count = awbViews.length;
-      const available = packingViews.length * 4;
 
-      if (available < count) {
-        throw new Error(
-          'Not enough packing list sections.\n' +
-          'AWB pages: ' + count + '\nAvailable sections: ' + available +
-          '\nMissing sections: ' + (count - available)
-        );
-      }
+      const pdfjs = await loadTextReader();
+      const awbText = await readTextPages(pdfjs, awbFile, awbViews, false, 'airway bill');
+      const packingText = await readTextPages(pdfjs, packingFile, packingViews, true, 'packing list');
+      const { pairs, sectionsWithIds } = matchSections(awbText, packingText);
 
       const result = await PDFLib.PDFDocument.create();
       const awbPages = await result.copyPages(awb, awb.getPageIndices());
-      const quadrantOffsets = [[0, 1], [0, 0], [1, 1], [1, 0]];
+      const embeddedSheets = new Map();
 
-      for (let index = 0; index < count; index += 4) {
-        const sheet = packing.getPage(index / 4);
-        const { box, rotation, width, height } = packingViews[index / 4];
+      for (const [index, { sheet, part }] of pairs.entries()) {
+        const { box, rotation, width, height } = packingViews[sheet];
         const halfWidth = width / 2;
         const halfHeight = height / 2;
 
-        // A blank sheet still needs a content stream for pdf-lib to embed it.
-        if (!sheet.node.Contents()) {
-          sheet.pushOperators(PDFLib.pushGraphicsState(), PDFLib.popGraphicsState());
+        if (!embeddedSheets.has(sheet)) {
+          const sourcePage = packing.getPage(sheet);
+          // pdf-lib needs a content stream even when the source page is blank.
+          if (!sourcePage.node.Contents()) {
+            sourcePage.pushOperators(PDFLib.pushGraphicsState(), PDFLib.popGraphicsState());
+          }
+          embeddedSheets.set(sheet, await result.embedPage(sourcePage, box));
         }
-        const embedded = await result.embedPage(sheet, box);
+
         const origins = {
-          0  : [0, 0],
-          90 : [0, height],
+          0: [0, 0],
+          90: [0, height],
           180: [width, height],
           270: [width, 0]
         };
         const [originX, originY] = origins[rotation];
+        const { column, row } = quadrants[part];
 
-        for (let part = 0; part < 4 && index + part < count; part++) {
-          const [column, row] = quadrantOffsets[part];
-          result.addPage(awbPages[index + part]);
-          const page = result.addPage([halfWidth, halfHeight]);
-          page.drawPage(embedded, {
-            x: originX - column * halfWidth,
-            y: originY - row * halfHeight,
-            rotate: PDFLib.degrees(-rotation)
-          });
-        }
+        result.addPage(awbPages[index]);
+        const page = result.addPage([halfWidth, halfHeight]);
+        page.drawPage(embeddedSheets.get(sheet), {
+          x: originX - column * halfWidth,
+          y: originY - (1 - row) * halfHeight,
+          rotate: PDFLib.degrees(-rotation)
+        });
       }
-      return { bytes: await result.save(), count, available };
+
+      return { bytes: await result.save(), count: pairs.length, sectionsWithIds };
     }
 
     const form = document.getElementById('combiner');
+    const awbInput = document.getElementById('awb');
+    const packingInput = document.getElementById('packing');
     const button = form.querySelector('button');
     const status = document.getElementById('status');
     const download = document.getElementById('download');
     let downloadUrl;
-    download.addEventListener('click', () => {
-      document.getElementById('awb').value = '';
-      document.getElementById('packing').value = '';
-    });
 
     function clearDownload() {
       if (downloadUrl) URL.revokeObjectURL(downloadUrl);
@@ -208,37 +392,44 @@
       download.hidden = true;
     }
 
+    download.addEventListener('click', () => {
+      awbInput.value = '';
+      packingInput.value = '';
+    });
+
     form.addEventListener('input', () => {
       clearDownload();
+      status.removeAttribute('data-error');
       status.textContent = '';
     });
 
     form.addEventListener('submit', async event => {
       event.preventDefault();
-      const awbFile = document.getElementById('awb').files[0];
-      const packingFile = document.getElementById('packing').files[0];
+      const awbFile = awbInput.files[0];
+      const packingFile = packingInput.files[0];
       clearDownload();
 
       button.disabled = true;
-      const inputs = form.querySelectorAll('input');
-      inputs.forEach(input => { input.disabled = true; });
+      awbInput.disabled = true;
+      packingInput.disabled = true;
       status.removeAttribute('data-error');
-      status.textContent = 'Combining PDFs…';
+      status.textContent = 'Reading Order IDs and combining PDFs…';
 
       try {
-        const { bytes, count, available } = await combine(awbFile, packingFile);
+        const { bytes, count, sectionsWithIds } = await combine(awbFile, packingFile);
         downloadUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
         download.href = downloadUrl;
         download.hidden = false;
-        status.textContent = (count * 2) + ' pages ready. Used ' + count + ' of ' +
-        available + ' packing list sections.';
+        status.textContent = (count * 2) + ' pages ready. Matched ' + count + ' of ' +
+          sectionsWithIds + ' packing list sections with readable Order IDs.';
       }
       catch (error) {
         status.setAttribute('data-error', '');
         status.textContent = error.message;
       }
       finally {
-        inputs.forEach(input => { input.disabled = false; });
+        awbInput.disabled = false;
+        packingInput.disabled = false;
         button.disabled = false;
       }
     });
